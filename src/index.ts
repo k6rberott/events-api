@@ -8,6 +8,7 @@ type EventItem = {
   description: string;
   startsAt: string;
   location: string;
+  host?: string;
   tags: string[];
   url?: string;
   imageUrl?: string;
@@ -19,6 +20,7 @@ type EventRow = {
   description: string;
   starts_at: string;
   location: string;
+  host: string | null;
   tags: string;
   url: string | null;
   image_url: string | null;
@@ -51,6 +53,7 @@ const toEvent = (row: EventRow, origin: string): EventItem => {
     startsAt: row.starts_at,
     location: row.location,
     tags: JSON.parse(row.tags) as string[],
+    host: row.host ?? undefined,
     url: row.url ?? undefined,
     imageUrl: toImageUrl(row.image_url, origin),
   };
@@ -97,6 +100,10 @@ const validate = (body: unknown): ValidationResult => {
         typeof value.description === "string" ? value.description.trim() : "",
       startsAt: value.startsAt as string,
       location: typeof value.location === "string" ? value.location.trim() : "",
+      host:
+        typeof value.host === "string" && value.host.trim() !== ""
+          ? value.host.trim()
+          : undefined,
       tags: Array.isArray(value.tags) ? value.tags.map(String) : [],
       url:
         typeof value.url === "string" && value.url.trim() !== ""
@@ -150,8 +157,8 @@ export default {
 
         const event = parsed.value;
         const row = await env.DB.prepare(
-          `INSERT INTO events (title, description, starts_at, location, tags, url, image_url)
-           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          `INSERT INTO events (title, description, starts_at, location, tags, url, image_url, host)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
         )
           .bind(
             event.title,
@@ -161,6 +168,7 @@ export default {
             JSON.stringify(event.tags),
             event.url ?? null,
             event.imageUrl ?? null,
+            event.host ?? null,
           )
           .first<EventRow>();
         return json(toEvent(row!, url.origin), 201);
