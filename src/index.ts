@@ -1,5 +1,11 @@
 type Env = {
   DB: D1Database;
+  // Valikuline: eelrenderdatud saidi Deploy Hook. Kui see on seatud, käivitab
+  // iga õnnestunud muudatus saidi uue buildi, et avalik kava uueneks.
+  DEPLOY_HOOK_URL?: string;
+  // Valikuline: halduse parool. Kui see on seatud, vajavad POST, PUT ja DELETE
+  // sisselogimisel saadud tokenit. Lugemine (GET) jääb avalikuks.
+  ADMIN_PASSWORD?: string;
 };
 
 type EventItem = {
@@ -8,7 +14,6 @@ type EventItem = {
   description: string;
   startsAt: string;
   location: string;
-  host?: string;
   tags: string[];
   url?: string;
   imageUrl?: string;
@@ -20,7 +25,6 @@ type EventRow = {
   description: string;
   starts_at: string;
   location: string;
-  host: string | null;
   tags: string;
   url: string | null;
   image_url: string | null;
@@ -29,7 +33,7 @@ type EventRow = {
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 const json = (data: unknown, status = 200): Response => {
@@ -38,6 +42,46 @@ const json = (data: unknown, status = 200): Response => {
 
 const error = (message: string, status: number): Response => {
   return json({ error: message }, status);
+};
+
+// --- Sisselogimine ---
+// Token on kujul "aegumisaeg.allkiri". Allkiri on HMAC, mille võti on parool:
+// tokenit ei saa võltsida ilma paroolita ja parooli vahetus tühistab vanad tokenid.
+// Serveris ei hoita midagi meeles, seega ei ole vaja andmebaasitabelit.
+const TOKEN_LIFETIME_MS = 8 * 60 * 60 * 1000;
+const encoder = new TextEncoder();
+
+const importKey = (secret: string) =>
+  crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+    "verify",
+  ]);
+
+const toBase64 = (bytes: ArrayBuffer) => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const fromBase64 = (text: string) => Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+
+const createToken = async (secret: string): Promise<string> => {
+  const expires = String(Date.now() + TOKEN_LIFETIME_MS);
+  const signature = await crypto.subtle.sign("HMAC", await importKey(secret), encoder.encode(expires));
+  return `${expires}.${toBase64(signature)}`;
+};
+
+const isValidToken = async (secret: string, header: string | null): Promise<boolean> => {
+  const [expires, signature] = (header?.replace(/^Bearer /, "") ?? "").split(".");
+  if (!expires || !signature || Number(expires) < Date.now()) return false;
+  try {
+    // verify võrdleb allkirju konstantse ajaga.
+    return await crypto.subtle.verify("HMAC", await importKey(secret), fromBase64(signature), encoder.encode(expires));
+  } catch {
+    return false; // vigane base64
+  }
+};
+
+// Tavaline === lõpetab esimese erineva märgi juures ja reedab ajastusega, kui palju klappis.
+const isSamePassword = (given: string, expected: string): boolean => {
+  const a = encoder.encode(given);
+  const b = encoder.encode(expected);
+  return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b);
 };
 
 const toImageUrl = (stored: string | null, origin: string): string | undefined => {
@@ -53,7 +97,6 @@ const toEvent = (row: EventRow, origin: string): EventItem => {
     startsAt: row.starts_at,
     location: row.location,
     tags: JSON.parse(row.tags) as string[],
-    host: row.host ?? undefined,
     url: row.url ?? undefined,
     imageUrl: toImageUrl(row.image_url, origin),
   };
@@ -100,10 +143,6 @@ const validate = (body: unknown): ValidationResult => {
         typeof value.description === "string" ? value.description.trim() : "",
       startsAt: value.startsAt as string,
       location: typeof value.location === "string" ? value.location.trim() : "",
-      host:
-        typeof value.host === "string" && value.host.trim() !== ""
-          ? value.host.trim()
-          : undefined,
       tags: Array.isArray(value.tags) ? value.tags.map(String) : [],
       url:
         typeof value.url === "string" && value.url.trim() !== ""
@@ -117,8 +156,20 @@ const validate = (body: unknown): ValidationResult => {
   };
 };
 
+// Uus build käib taustal: vastus ei oota buildi ära ja buildi viga ei muuda vastust.
+const triggerRebuild = (env: Env, ctx: ExecutionContext): void => {
+  if (!env.DEPLOY_HOOK_URL) return;
+  ctx.waitUntil(
+    fetch(env.DEPLOY_HOOK_URL, { method: "POST" })
+      .then((response) => {
+        if (!response.ok) console.error(`Deploy Hook vastas veaga ${response.status}`);
+      })
+      .catch((caught) => console.error("Deploy Hooki ei saanud kätte", caught)),
+  );
+};
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
@@ -127,11 +178,28 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
     const id = parts[2] ? Number(parts[2]) : null;
 
+    // --- POST /api/login ---
+    if (request.method === "POST" && url.pathname === "/api/login") {
+      if (!env.ADMIN_PASSWORD) return error("Sisselogimine ei ole seadistatud", 404);
+      const body = (await request.json().catch(() => null)) as { password?: unknown } | null;
+      if (typeof body?.password !== "string" || !isSamePassword(body.password, env.ADMIN_PASSWORD)) {
+        return error("Vale parool", 401);
+      }
+      return json({ token: await createToken(env.ADMIN_PASSWORD) });
+    }
+
     if (parts[0] !== "api" || parts[1] !== "events") {
       return error("Tundmatu lõpp-punkt", 404);
     }
     if (parts[2] !== undefined && !Number.isInteger(id)) {
       return error("Vigane id", 400);
+    }
+
+    // Kirjutavad päringud vajavad tokenit. Haldusvaate peitmine üksi ei kaitseks
+    // midagi: API-le saab päringu saata ka curl-iga, haldusvaadet avamata.
+    const isWrite = request.method !== "GET";
+    if (isWrite && env.ADMIN_PASSWORD && !(await isValidToken(env.ADMIN_PASSWORD, request.headers.get("Authorization")))) {
+      return error("Logi sisse", 401);
     }
 
     try {
@@ -157,8 +225,8 @@ export default {
 
         const event = parsed.value;
         const row = await env.DB.prepare(
-          `INSERT INTO events (title, description, starts_at, location, tags, url, image_url, host)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          `INSERT INTO events (title, description, starts_at, location, tags, url, image_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
         )
           .bind(
             event.title,
@@ -168,9 +236,9 @@ export default {
             JSON.stringify(event.tags),
             event.url ?? null,
             event.imageUrl ?? null,
-            event.host ?? null,
           )
           .first<EventRow>();
+        triggerRebuild(env, ctx);
         return json(toEvent(row!, url.origin), 201);
       }
 
@@ -197,18 +265,18 @@ export default {
             id,
           )
           .first<EventRow>();
-        return row
-          ? json(toEvent(row, url.origin))
-          : error("Sündmust ei leitud", 404);
+        if (!row) return error("Sündmust ei leitud", 404);
+        triggerRebuild(env, ctx);
+        return json(toEvent(row, url.origin));
       }
 
       if (request.method === "DELETE" && id !== null) {
         const result = await env.DB.prepare("DELETE FROM events WHERE id = ?")
           .bind(id)
           .run();
-        return result.meta.changes > 0
-          ? new Response(null, { status: 204, headers: CORS })
-          : error("Sündmust ei leitud", 404);
+        if (result.meta.changes === 0) return error("Sündmust ei leitud", 404);
+        triggerRebuild(env, ctx);
+        return new Response(null, { status: 204, headers: CORS });
       }
 
       return error("Meetod ei ole lubatud", 405);
